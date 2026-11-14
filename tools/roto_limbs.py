@@ -2,7 +2,7 @@
 """Mask the fox's paws/feet per frame and composite a recoloured layer over them.
 
 Usage:
-  roto_limbs.py <keys.json> <base_png_dir> <layer_png_dir> <out_png_dir> [--debug DIR] [--masks DIR]
+  roto_limbs.py <keys.json> <base_png_dir> <layer_png_dir> <out_png_dir> [--debug DIR] [--masks DIR] [--hold-frames DIR]
 
 keys.json maps limb name -> {frame: {"seed": [x, y], "cut": [[x1, y1], [x2, y2]]}}
 or {frame: {"seed": [x, y], "poly": [[x, y], ...]}}. Between keyed frames the
@@ -19,6 +19,12 @@ it from a body or tail it overlaps, and the cut line sets where the brown stops
 on the forearm or shin. The mask is then grown by a few pixels so it covers the
 paw's outline edge and finger lines (both identical in the two layers), and
 feathered across the cut line so the colour change does not alias.
+
+Kling animates on twos: when a frame repeats the previous drawing, the
+previous frame's mask is reused unchanged (whatever the keys say) so the brown
+edge cannot drift on a held pose. Holds are detected on --hold-frames (the
+original green-screen frames as PNGs) when given, else on the base frames. A seed that lands in a tiny closed area (between toe lines, on an
+outline) is moved to the nearest reasonably sized component within SNAP px.
 """
 import json
 import os
@@ -35,6 +41,20 @@ except ImportError:  # pragma: no cover
 MAX_R = 260  # px, generous: the cut line and outline do the real limiting
 GROW = 6  # px of dilation to cover the paw outline/finger lines
 FEATHER = 1.5  # px gaussian sigma on the final mask
+MIN_AREA = 150  # px: smaller seed components are toe gaps or outline specks
+SNAP = 45  # px search radius for a better seed component
+HOLD_DIFF = 0.003  # changed-pixel fraction below which a frame is a hold (moving frames: >2.5%)
+# the sprint frames, and the blurred mid-turn/back-view frames, have no outline
+# around the paws, so their masks get a softer edge that reads as part of the
+# blur rather than a visible line
+FEATHER_BY_PREFIX = {"run_": 5.0, "soft_": 4.0}
+
+
+def feather_for(limb):
+    for prefix, sigma in FEATHER_BY_PREFIX.items():
+        if limb.startswith(prefix):
+            return sigma
+    return FEATHER
 
 
 def interp_keys(keys, frame):
@@ -82,14 +102,20 @@ def limb_mask(interior, seed, form, pts):
     sx, sy = int(round(seed[0])), int(round(seed[1]))
     sx, sy = min(max(sx, 0), w - 1), min(max(sy, 0), h - 1)
     lid = lab[sy, sx]
-    if lid == 0:  # seed landed on a line: take the nearest component
-        ys, xs = np.nonzero(lab)
-        if len(xs) == 0:
+    if lid == 0 or (lab == lid).sum() < MIN_AREA:
+        # seed on a line or in a toe gap: take the nearest real component
+        y0, x0 = max(sy - SNAP, 0), max(sx - SNAP, 0)
+        win = lab[y0:sy + SNAP + 1, x0:sx + SNAP + 1]
+        best, lid = None, 0
+        for k in np.unique(win[win > 0]):
+            if (lab == k).sum() < MIN_AREA:
+                continue
+            ys, xs = np.nonzero(win == k)
+            d = ((xs + x0 - sx) ** 2 + (ys + y0 - sy) ** 2).min()
+            if best is None or d < best:
+                best, lid = d, k
+        if lid == 0:
             return np.zeros((h, w), bool)
-        i = np.argmin((xs - sx) ** 2 + (ys - sy) ** 2)
-        if (xs[i] - sx) ** 2 + (ys[i] - sy) ** 2 > 40 ** 2:
-            return np.zeros((h, w), bool)
-        lid = lab[ys[i], xs[i]]
     m = (lab == lid).astype(np.uint8)
     m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * GROW + 1,) * 2))
     return (m > 0) & half
@@ -99,6 +125,8 @@ def main():
     keys_path, base_dir, layer_dir, out_dir = sys.argv[1:5]
     debug = sys.argv[sys.argv.index("--debug") + 1] if "--debug" in sys.argv else None
     masks = sys.argv[sys.argv.index("--masks") + 1] if "--masks" in sys.argv else None
+    hold_dir = sys.argv[sys.argv.index("--hold-frames") + 1] if "--hold-frames" in sys.argv else None
+    hold_names = sorted(os.listdir(hold_dir)) if hold_dir else None
     if masks:
         os.makedirs(masks, exist_ok=True)
     keys = json.load(open(keys_path))
@@ -106,22 +134,33 @@ def main():
     if debug:
         os.makedirs(debug, exist_ok=True)
     names = sorted(os.listdir(base_dir))
+    prev_small, prev_mask, prev_cuts = None, None, None
     for i, name in enumerate(names):
         base = np.asarray(Image.open(os.path.join(base_dir, name)).convert("RGBA"))
         layer = np.asarray(Image.open(os.path.join(layer_dir, name)).convert("RGBA"))
-        interior = interior_mask(base)
-        mask = np.zeros(interior.shape, bool)
-        cuts = []
-        for limb, lk in keys.items():
-            st = interp_keys(lk, i)
-            if st is None:
-                continue
-            seed, form, pts = st
-            mask |= limb_mask(interior, seed, form, pts)
-            cuts.append((limb, seed, form, pts))
-        m = mask.astype(np.float32)
-        if mask.any():
-            m = cv2.GaussianBlur(m, (0, 0), FEATHER)
+        ref = (np.asarray(Image.open(os.path.join(hold_dir, hold_names[i])).convert("L"))
+               if hold_dir else cv2.cvtColor(base[..., :3], cv2.COLOR_RGB2GRAY))
+        small = cv2.resize(ref, (480, 270), interpolation=cv2.INTER_AREA).astype(np.int16)
+        # a held drawing keeps the previous mask even if a limb span starts or
+        # ends on it, so the brown never changes on a still pose
+        held = (prev_small is not None
+                and (np.abs(small - prev_small) > 20).mean() < HOLD_DIFF)
+        if held:
+            m, cuts = prev_mask, prev_cuts
+        else:
+            interior = interior_mask(base)
+            m = np.zeros(interior.shape, np.float32)
+            cuts = []
+            for limb, lk in keys.items():
+                st = interp_keys(lk, i)
+                if st is None:
+                    continue
+                seed, form, pts = st
+                lm = limb_mask(interior, seed, form, pts).astype(np.float32)
+                if lm.any():
+                    m = np.maximum(m, cv2.GaussianBlur(lm, (0, 0), feather_for(limb)))
+                cuts.append((limb, seed, form, pts))
+        prev_small, prev_mask, prev_cuts = small, m, cuts
         if masks:
             Image.fromarray(np.clip(m * 255 + 0.5, 0, 255).astype(np.uint8), "L").save(
                 os.path.join(masks, name), compress_level=3)
