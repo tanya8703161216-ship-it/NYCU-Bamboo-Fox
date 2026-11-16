@@ -5,10 +5,9 @@ Each ear is a white inner-ear shape with a thin orange strip between it and
 the dark-blue outline on the side facing the head. The keyframes turn the
 upper part of that strip brown. Per frame:
 
-  * the two inner-ear whites are found as the white blobs nearest the top of
-    the head (largest-first among the top candidates);
+  * the two inner-ear whites are the white blobs reaching highest;
   * each ear gets an axis from the white blob's centroid to its apex (the
-    white pixel farthest from the face centre);
+    white pixel farthest from a head centre placed below and between them);
   * the strip is the orange fill within STRIP px of that white blob, and a
     pixel turns brown when its position along the axis is beyond the cut
     fraction measured on the reference keyframe for that ear (left/right).
@@ -35,7 +34,8 @@ STRIP = 55  # px from the inner-ear white that the orange strip can reach
 FEATHER = 1.2
 HOLD_DIFF = 0.003
 AREA_BAND = (0.7, 1.3)  # allowed tip area relative to the segment median
-MAX_TIP = 2500  # px: largest plausible brown ear tip at 1080p
+MAX_TIP = 2500
+EAR_WHITE_MAX = 18000  # px: largest inner-ear white (01's near ear is ~14.7k)  # px: largest plausible brown ear tip at 1080p
 BROWN = np.array([153, 59, 21])
 
 
@@ -55,15 +55,17 @@ def ears(rgb):
     """Return [(white_mask, centroid, apex)] for the left and right ear."""
     screen, blue, white, orange, brown = classes(rgb)
     n, lab, st, cen = cv2.connectedComponentsWithStats(white.astype(np.uint8), 8)
-    cands = [i for i in range(1, n) if st[i, 4] > 1500]
-    if len(cands) < 3:
+    # inner-ear whites only: the tail tip and face are far larger
+    cands = [i for i in range(1, n) if 1500 < st[i, 4] < EAR_WHITE_MAX]
+    if len(cands) < 2:
         return None
-    # the face white is the largest; the ears are the two highest of the rest
-    face = max(cands, key=lambda i: st[i, 4])
-    rest = sorted((i for i in cands if i != face), key=lambda i: st[i, 1])[:2]
-    if len(rest) < 2:
-        return None
-    fc = cen[face]
+    # the ears are the two white blobs reaching highest; the head centre is a
+    # point below and between them (face whites and the tail tip vary too
+    # much between poses to anchor on)
+    rest = sorted(cands, key=lambda i: st[i, 1])[:2]
+    c0, c1 = np.array(cen[rest[0]]), np.array(cen[rest[1]])
+    spread = np.linalg.norm(c1 - c0)
+    fc = (c0 + c1) / 2 + np.array([0.0, spread])
     out = []
     for i in sorted(rest, key=lambda i: cen[i][0]):
         m = lab == i
